@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
@@ -42,7 +43,7 @@ def parse_target(target):
         hostname = parsed.hostname or target
         port = parsed.port
         return hostname, port
-    # Handle hostname:port format
+    # Handle hostname:port format (but not IPv6 addresses)
     elif ':' in target and not target.startswith('['):
         parts = target.rsplit(':', 1)
         if parts[1].isdigit():
@@ -79,19 +80,21 @@ def banner():
     {Colors.RESET}""")
 
 
-def run_command(cmd, capture=False, check=False):
-    """Run a shell command."""
+def run_command(cmd, capture=False, check=False, timeout=300):
+    """Run a shell command with optional timeout."""
     try:
         if capture:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=check)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout)
             return result.returncode == 0, result.stdout, result.stderr
         else:
-            result = subprocess.run(cmd, check=check)
+            result = subprocess.run(cmd, check=check, timeout=timeout)
             return result.returncode == 0, "", ""
     except subprocess.CalledProcessError as e:
         return False, "", str(e)
     except FileNotFoundError:
         return False, "", "Command not found"
+    except subprocess.TimeoutExpired:
+        return False, "", f"Command timed out after {timeout}s"
 
 
 def detect_distro():
@@ -159,13 +162,20 @@ def setup_blackarch_repo():
     # Download and install blackarch repo config
     print(f"    {Colors.CYAN}[*] Downloading BlackArch repository config...{Colors.RESET}")
 
-    # Check if curl or wget is available
-    _, _, _ = run_command(['which', 'curl'], capture=True)
-    downloader = 'curl'
+    # Check for available downloader (curl preferred, fallback to wget)
+    downloader = None
+    success, out, _ = run_command(['which', 'curl'], capture=True)
+    if success and out.strip():
+        downloader = 'curl'
+    else:
+        success, out, _ = run_command(['which', 'wget'], capture=True)
+        if success and out.strip():
+            downloader = 'wget'
 
-    _, out, _ = run_command(['which', 'wget'], capture=True)
-    if not out.strip():
-        downloader = 'wget'
+    if not downloader:
+        print(f"    {Colors.RED}[✗]{Colors.RESET} Neither curl nor wget found")
+        print(f"    {Colors.YELLOW}[!] Please manually install tools with: pacman -S nmap subfinder ffuf python-pipx{Colors.RESET}")
+        return False
 
     if downloader == 'curl':
         success, _, err = run_command([
@@ -179,7 +189,7 @@ def setup_blackarch_repo():
         ])
 
     if not success:
-        print(f"    {Colors.RED}[✗]{Colors.RESET} Failed to download BlackArch setup script")
+        print(f"    {Colors.RED}[✗]{Colors.RESET} Failed to download BlackArch setup script: {err}")
         print(f"    {Colors.YELLOW}[!] Please manually install tools with: pacman -S nmap subfinder ffuf python-pipx{Colors.RESET}")
         return False
 
@@ -187,19 +197,18 @@ def setup_blackarch_repo():
     run_command(['chmod', '+x', '/tmp/blackarch-repo.sh'])
 
     print(f"    {Colors.CYAN}[*] Running BlackArch repository setup...{Colors.RESET}")
-    print(f"    {Colors.YELLOW}[!] This requires root privileges{Colors.RESET}")
 
-    # Run the strap script
-    success, _, err = run_command(['sudo', 'bash', '/tmp/blackarch-repo.sh'])
+    # Already running as root, no need for sudo
+    success, _, err = run_command(['bash', '/tmp/blackarch-repo.sh'])
 
     if not success:
-        print(f"    {Colors.RED}[✗]{Colors.RESET} Failed to setup BlackArch repository")
+        print(f"    {Colors.RED}[✗]{Colors.RESET} Failed to setup BlackArch repository: {err}")
         print(f"    {Colors.YELLOW}[!] You may need to manually add the repo or install tools individually{Colors.RESET}")
         return False
 
     # Update pacman database
     print(f"    {Colors.CYAN}[*] Updating package database...{Colors.RESET}")
-    run_command(['sudo', 'pacman', '-Sy'])
+    run_command(['pacman', '-Sy', '--noconfirm'])
 
     print(f"    {Colors.GREEN}[✓]{Colors.RESET} BlackArch repository configured!")
     return True
@@ -231,14 +240,14 @@ def install_tools_arch(tools_to_install):
     # Install pacman packages
     if packages:
         print(f"    {Colors.CYAN}[*] Installing: {' '.join(packages)}{Colors.RESET}")
-        success, _, _ = run_command(['sudo', 'pacman', '-S', '--noconfirm'] + packages)
+        success, _, _ = run_command(['pacman', '-S', '--noconfirm'] + packages)
         if not success:
             print(f"    {Colors.RED}[✗]{Colors.RESET} Failed to install some packages")
 
     # Install pipx if needed
     if pipx_tools:
         print(f"    {Colors.CYAN}[*] Setting up pipx...{Colors.RESET}")
-        run_command(['sudo', 'pacman', '-S', '--noconfirm', 'python-pipx'])
+        run_command(['pacman', '-S', '--noconfirm', 'python-pipx'])
         run_command(['pipx', 'ensurepath'])
 
         for tool in pipx_tools:
@@ -256,10 +265,21 @@ def install_tools_arch(tools_to_install):
                     run_command(['go', 'install', 'github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest'])
         else:
             print(f"    {Colors.YELLOW}[!] Go not found, downloading subfinder binary...{Colors.RESET}")
-            run_command(['curl', '-L', 'https://github.com/projectdiscovery/subfinder/releases/latest/download/subfinder_linux_amd64.zip', '-o', '/tmp/subfinder.zip'])
-            run_command(['unzip', '-o', '/tmp/subfinder.zip', '-d', '/usr/local/bin/'])
-            run_command(['chmod', '+x', '/usr/local/bin/subfinder'])
-            run_command(['rm', '/tmp/subfinder.zip'])
+            # Check for unzip
+            if not shutil.which('unzip'):
+                print(f"    {Colors.YELLOW}[!] Installing unzip...{Colors.RESET}")
+                run_command(['pacman', '-S', '--noconfirm', 'unzip'])
+
+            success, _, err = run_command([
+                'curl', '-L', 'https://github.com/projectdiscovery/subfinder/releases/latest/download/subfinder_linux_amd64.zip',
+                '-o', '/tmp/subfinder.zip'
+            ])
+            if success:
+                run_command(['unzip', '-o', '/tmp/subfinder.zip', '-d', '/usr/local/bin/'])
+                run_command(['chmod', '+x', '/usr/local/bin/subfinder'])
+                run_command(['rm', '/tmp/subfinder.zip'])
+            else:
+                print(f"    {Colors.RED}[✗]{Colors.RESET} Failed to download subfinder: {err}")
 
     print(f"    {Colors.GREEN}[✓]{Colors.RESET} Installation complete!")
 
@@ -285,12 +305,12 @@ def install_tools_debian(tools_to_install):
 
     # Update package list first
     print(f"    {Colors.CYAN}[*] Updating package list...{Colors.RESET}")
-    run_command(['sudo', 'apt', 'update'])
+    run_command(['apt', 'update'])
 
     # Install all packages at once
     if packages:
         print(f"    {Colors.CYAN}[*] Installing: {' '.join(packages)}{Colors.RESET}")
-        success, _, _ = run_command(['sudo', 'apt', 'install', '-y'] + packages)
+        success, _, _ = run_command(['apt', 'install', '-y'] + packages)
         if not success:
             print(f"    {Colors.RED}[✗]{Colors.RESET} Failed to install some packages")
             print(f"    {Colors.YELLOW}[!] Some tools may need manual installation{Colors.RESET}")
@@ -300,11 +320,7 @@ def install_tools_debian(tools_to_install):
 
 def check_tool(tool_name):
     """Check if a tool is installed."""
-    try:
-        subprocess.run(['which', tool_name], capture_output=True, check=True)
-        return True
-    except subprocess.CalledProcessError:
-        return False
+    return shutil.which(tool_name) is not None
 
 
 def check_dependencies(auto_install=False):
@@ -374,7 +390,9 @@ def check_dependencies(auto_install=False):
 def create_output_dir(target):
     """Create output directory for results."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_target = target.replace('http://', '').replace('https://', '').replace('/', '_')
+    # Sanitize target for directory name
+    safe_target = re.sub(r'^https?://', '', target)
+    safe_target = safe_target.replace('/', '_').replace(':', '_')
     output_dir = Path.cwd() / f"recon_{safe_target}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
@@ -392,6 +410,7 @@ def run_nmap(target, output_dir, quick=False):
     # Build nmap command
     cmd = ['nmap', '-sV', '-sC', '--open', '-oN', str(output_file)]
     if not quick:
+        # Add UDP scan (-sU) for comprehensive scan
         cmd.insert(1, '-sU')
     if port:
         cmd.extend(['-p', str(port)])
@@ -403,7 +422,7 @@ def run_nmap(target, output_dir, quick=False):
     except subprocess.CalledProcessError as e:
         print(f"    {Colors.RED}[✗]{Colors.RESET} nmap failed: {e}")
     except FileNotFoundError:
-        print(f"    {Colors.RED}[✗]{Colors.RESET} nmap not found. Run: sudo pacman -S nmap")
+        print(f"    {Colors.RED}[✗]{Colors.RESET} nmap not found. Run: pacman -S nmap / apt install nmap")
 
 
 def run_autorecon(target, output_dir):
@@ -420,7 +439,7 @@ def run_autorecon(target, output_dir):
     except subprocess.CalledProcessError as e:
         print(f"    {Colors.RED}[✗]{Colors.RESET} autorecon failed: {e}")
     except FileNotFoundError:
-        print(f"    {Colors.RED}[✗]{Colors.RESET} autorecon not found. Install with: sudo apt install python3-autorecon")
+        print(f"    {Colors.RED}[✗]{Colors.RESET} autorecon not found. Install with: pipx install autorecon")
 
 
 def run_subfinder(domain, output_dir):
@@ -476,7 +495,7 @@ def run_ffuf(target, output_dir, wordlist=None):
     except subprocess.CalledProcessError as e:
         print(f"    {Colors.RED}[✗]{Colors.RESET} ffuf failed: {e}")
     except FileNotFoundError:
-        print(f"    {Colors.RED}[✗]{Colors.RESET} ffuf not found. Run: sudo pacman -S ffuf")
+        print(f"    {Colors.RED}[✗]{Colors.RESET} ffuf not found. Run: pacman -S ffuf / apt install ffuf")
 
 
 def run_recon_ng(target, output_dir):
@@ -513,7 +532,7 @@ Examples:
   %(prog)s -t example.com --no-install  # Skip auto-installation
         """
     )
-    
+
     parser.add_argument('-t', '--target', required=True, help='Target domain or URL')
     parser.add_argument('-m', '--modules', default='all',
                        help='Comma-separated modules: nmap,autorecon,subfinder,ffuf,recon-ng (default: all)')
@@ -521,37 +540,37 @@ Examples:
     parser.add_argument('-q', '--quick', action='store_true', help='Quick scan mode (skip UDP scans)')
     parser.add_argument('--no-install', action='store_true', help='Skip automatic installation of missing tools')
     parser.add_argument('--version', action='version', version='D4YONE-RECON v2.0')
-    
+
     args = parser.parse_args()
-    
+
     banner()
-    
+
     # Check root privileges
     check_root()
-    
+
     # Check and install dependencies
     deps_ok = check_dependencies(auto_install=not args.no_install)
-    
+
     if not deps_ok and not args.no_install:
         print(f"\n{Colors.YELLOW}[!] Some tools may still be missing. Continuing anyway...{Colors.RESET}")
     elif not deps_ok:
         print(f"\n{Colors.RED}[!] Missing tools and auto-install disabled{Colors.RESET}")
         print("    Install manually or run without --no-install")
         sys.exit(1)
-    
+
     # Create output directory
     output_dir = create_output_dir(args.target)
     print(f"\n{Colors.GREEN}[+] Output directory: {output_dir}{Colors.RESET}")
-    
+
     # Parse modules
     if args.modules == 'all':
         modules = ['nmap', 'autorecon', 'subfinder', 'ffuf', 'recon-ng']
     else:
         modules = [m.strip() for m in args.modules.split(',')]
-    
+
     # Extract domain for subfinder
     domain = args.target.replace('http://', '').replace('https://', '').split('/')[0]
-    
+
     # Run selected modules
     for module in modules:
         if module == 'nmap':
@@ -566,7 +585,7 @@ Examples:
             run_recon_ng(args.target, output_dir)
         else:
             print(f"\n{Colors.RED}[!] Unknown module: {module}{Colors.RESET}")
-    
+
     print(f"\n{Colors.GREEN}{Colors.BOLD}=== Reconnaissance Complete ==={Colors.RESET}")
     print(f"Results saved to: {output_dir}")
     print(f"{Colors.CYAN}Review findings and proceed with analysis.{Colors.RESET}\n")
